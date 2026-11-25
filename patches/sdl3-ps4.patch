@@ -1,0 +1,267 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 90b368d..c68826d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -318,6 +318,7 @@ dep_option(SDL_DBUS                "Enable D-Bus support" ON "${UNIX_SYS}" OFF)
+ dep_option(SDL_LIBURING            "Enable liburing support" ON "${UNIX_SYS}" OFF)
+ dep_option(SDL_DISKAUDIO           "Support the disk writer audio driver" ON "SDL_AUDIO" OFF)
+ dep_option(SDL_DUMMYAUDIO          "Support the dummy audio driver" ON "SDL_AUDIO" OFF)
++dep_option(SDL_PS4AUDIO            "Support the PS4 audio driver (sceAudioOut, OpenOrbis headers)" OFF "SDL_AUDIO" OFF)
+ dep_option(SDL_DUMMYVIDEO          "Use dummy video driver" ON "SDL_VIDEO" OFF)
+ dep_option(SDL_IBUS                "Enable IBus support" ON "${UNIX_SYS}" OFF)
+ dep_option(SDL_OPENGL              "Include OpenGL support" ON "SDL_VIDEO;NOT IOS;NOT VISIONOS;NOT TVOS;NOT WATCHOS" OFF)
+@@ -1350,6 +1351,16 @@ if(SDL_AUDIO)
+     set(HAVE_DISKAUDIO TRUE)
+     set(HAVE_SDL_AUDIO TRUE)
+   endif()
++  # PS4 homebrew (OpenOrbis): sceAudioOut, selected with -DSDL_PS4AUDIO=ON
++  if(SDL_PS4AUDIO)
++    set(SDL_AUDIO_DRIVER_PS4 1)
++    sdl_glob_sources(
++      "${SDL3_SOURCE_DIR}/src/audio/ps4/*.c"
++      "${SDL3_SOURCE_DIR}/src/audio/ps4/*.h"
++    )
++    set(HAVE_PS4AUDIO TRUE)
++    set(HAVE_SDL_AUDIO TRUE)
++  endif()
+ endif()
+ 
+ if(SDL_CAMERA)
+diff --git a/include/build_config/SDL_build_config.h.cmake b/include/build_config/SDL_build_config.h.cmake
+index 17cb8f2..f90df22 100644
+--- a/include/build_config/SDL_build_config.h.cmake
++++ b/include/build_config/SDL_build_config.h.cmake
+@@ -288,6 +288,7 @@
+ #cmakedefine SDL_AUDIO_DRIVER_VITA 1
+ #cmakedefine SDL_AUDIO_DRIVER_PSP 1
+ #cmakedefine SDL_AUDIO_DRIVER_PS2 1
++#cmakedefine SDL_AUDIO_DRIVER_PS4 1
+ #cmakedefine SDL_AUDIO_DRIVER_N3DS 1
+ #cmakedefine SDL_AUDIO_DRIVER_NGAGE 1
+ #cmakedefine SDL_AUDIO_DRIVER_QNX 1
+diff --git a/src/audio/SDL_audio.c b/src/audio/SDL_audio.c
+index aed406c..287c2a5 100644
+--- a/src/audio/SDL_audio.c
++++ b/src/audio/SDL_audio.c
+@@ -71,6 +71,9 @@ static const AudioBootStrap *const bootstrap[] = {
+ #ifdef SDL_AUDIO_DRIVER_PSP
+     &PSPAUDIO_bootstrap,
+ #endif
++#ifdef SDL_AUDIO_DRIVER_PS4
++    &PS4AUDIO_bootstrap,
++#endif
+ #ifdef SDL_AUDIO_DRIVER_VITA
+     &VITAAUD_bootstrap,
+ #endif
+diff --git a/src/audio/SDL_sysaudio.h b/src/audio/SDL_sysaudio.h
+index 9104be8..5c32d09 100644
+--- a/src/audio/SDL_sysaudio.h
++++ b/src/audio/SDL_sysaudio.h
+@@ -385,6 +385,7 @@ extern AudioBootStrap AAUDIO_bootstrap;
+ extern AudioBootStrap OPENSLES_bootstrap;
+ extern AudioBootStrap PS2AUDIO_bootstrap;
+ extern AudioBootStrap PSPAUDIO_bootstrap;
++extern AudioBootStrap PS4AUDIO_bootstrap;
+ extern AudioBootStrap VITAAUD_bootstrap;
+ extern AudioBootStrap N3DSAUDIO_bootstrap;
+ extern AudioBootStrap NGAGEAUDIO_bootstrap;
+diff --git a/src/audio/ps4/SDL_ps4audio.c b/src/audio/ps4/SDL_ps4audio.c
+new file mode 100644
+index 0000000..003f8f1
+--- /dev/null
++++ b/src/audio/ps4/SDL_ps4audio.c
+@@ -0,0 +1,148 @@
++/*
++  Simple DirectMedia Layer
++  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
++
++  This software is provided 'as-is', without any express or implied
++  warranty.  In no event will the authors be held liable for any damages
++  arising from the use of this software.
++
++  Permission is granted to anyone to use this software for any purpose,
++  including commercial applications, and to alter it and redistribute it
++  freely, subject to the following restrictions:
++
++  1. The origin of this software must not be misrepresented; you must not
++     claim that you wrote the original software. If you use this software
++     in a product, an acknowledgment in the product documentation would be
++     appreciated but is not required.
++  2. Altered source versions must be plainly marked as such, and must not be
++     misrepresented as being the original software.
++  3. This notice may not be removed or altered from any source distribution.
++*/
++#include "SDL_internal.h"
++
++// PlayStation 4 audio output (homebrew, OpenOrbis headers; link with -lSceAudioOut).
++// The "AudioOut" system module must be loaded by the application before SDL opens a device.
++
++#ifdef SDL_AUDIO_DRIVER_PS4
++
++#include "../SDL_sysaudio.h"
++#include "SDL_ps4audio.h"
++
++#include <orbis/AudioOut.h>
++#include <orbis/_types/errors.h>
++#include <orbis/_types/user.h>
++
++// sceAudioOutOpen() takes a block length of 256 * n sample frames, n = 1..8 (5.3 - 42.7 ms at 48 kHz)
++#define PS4AUDIO_GRAIN      256
++#define PS4AUDIO_MIN_FRAMES 256
++#define PS4AUDIO_MAX_FRAMES 2048
++
++#define PS4AUDIO_PORT_MAIN  0   // ORBIS_AUDIO_OUT_PORT_TYPE_MAIN
++#define PS4AUDIO_FREQ       48000
++#define PS4AUDIO_VOLUME_ALL 0x03 // left + right channel flags (sceAudioOutSetVolume)
++#define PS4AUDIO_VOLUME_MAX 0x8000
++
++static bool PS4AUDIO_OpenDevice(SDL_AudioDevice *device)
++{
++    if (device->recording) {
++        return SDL_SetError("PS4 audio: recording is not supported");
++    }
++
++    device->hidden = (struct SDL_PrivateAudioData *)SDL_calloc(1, sizeof(*device->hidden));
++    if (!device->hidden) {
++        return false;
++    }
++    device->hidden->port = -1;
++
++    // The main port plays 48 kHz stereo; SDL converts whatever the application asked for.
++    device->spec.freq = PS4AUDIO_FREQ;
++    device->spec.channels = 2;
++    device->spec.format = SDL_AUDIO_S16LE;
++
++    // The block length must be a multiple of 256 sample frames, 256 to 2048.
++    int frames = ((device->sample_frames + PS4AUDIO_GRAIN - 1) / PS4AUDIO_GRAIN) * PS4AUDIO_GRAIN;
++    frames = SDL_clamp(frames, PS4AUDIO_MIN_FRAMES, PS4AUDIO_MAX_FRAMES);
++    device->sample_frames = frames;
++
++    // Update the fragment size as size in bytes.
++    SDL_UpdatedAudioDeviceFormat(device);
++
++    const int mixlen = device->buffer_size * PS4AUDIO_NUM_BUFFERS;
++    device->hidden->rawbuf = (Uint8 *)SDL_aligned_alloc(256, mixlen);
++    if (!device->hidden->rawbuf) {
++        return SDL_SetError("Couldn't allocate mixing buffer");
++    }
++    SDL_memset(device->hidden->rawbuf, device->silence_value, mixlen);
++    for (int i = 0; i < PS4AUDIO_NUM_BUFFERS; i++) {
++        device->hidden->mixbufs[i] = &device->hidden->rawbuf[i * device->buffer_size];
++    }
++
++    const int port = sceAudioOutOpen(ORBIS_USER_SERVICE_USER_ID_SYSTEM, PS4AUDIO_PORT_MAIN, 0,
++                                     (uint32_t)device->sample_frames, (uint32_t)device->spec.freq,
++                                     ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
++    if (port < 0) {
++        return SDL_SetError("Couldn't open audio out port: 0x%x", (unsigned int)port);
++    }
++    device->hidden->port = port;
++
++    int vols[2] = { PS4AUDIO_VOLUME_MAX, PS4AUDIO_VOLUME_MAX };
++    sceAudioOutSetVolume(port, PS4AUDIO_VOLUME_ALL, vols);
++
++    return true;
++}
++
++// sceAudioOutOutput() blocks until the console can take the block, which paces the audio thread:
++// no WaitDevice is needed.
++static bool PS4AUDIO_PlayDevice(SDL_AudioDevice *device, const Uint8 *buffer, int buflen)
++{
++    const int ret = sceAudioOutOutput(device->hidden->port, buffer);
++    if (ret < 0) {
++        return SDL_SetError("sceAudioOutOutput failed: 0x%x", (unsigned int)ret);
++    }
++    return true;
++}
++
++static Uint8 *PS4AUDIO_GetDeviceBuf(SDL_AudioDevice *device, int *buffer_size)
++{
++    Uint8 *buffer = device->hidden->mixbufs[device->hidden->next_buffer];
++    device->hidden->next_buffer = (device->hidden->next_buffer + 1) % PS4AUDIO_NUM_BUFFERS;
++    return buffer;
++}
++
++static void PS4AUDIO_CloseDevice(SDL_AudioDevice *device)
++{
++    if (device->hidden) {
++        if (device->hidden->port >= 0) {
++            sceAudioOutClose(device->hidden->port);
++            device->hidden->port = -1;
++        }
++        if (device->hidden->rawbuf) {
++            SDL_aligned_free(device->hidden->rawbuf); // this uses SDL_aligned_alloc(), not SDL_malloc()
++            device->hidden->rawbuf = NULL;
++        }
++        SDL_free(device->hidden);
++        device->hidden = NULL;
++    }
++}
++
++static bool PS4AUDIO_Init(SDL_AudioDriverImpl *impl)
++{
++    // Only the first caller in the process initializes the library; a second call is not an error.
++    const int ret = sceAudioOutInit();
++    if (ret < 0 && (unsigned int)ret != ORBIS_AUDIO_OUT_ERROR_ALREADY_INIT) {
++        return SDL_SetError("sceAudioOutInit failed: 0x%x", (unsigned int)ret);
++    }
++
++    impl->OpenDevice = PS4AUDIO_OpenDevice;
++    impl->PlayDevice = PS4AUDIO_PlayDevice;
++    impl->GetDeviceBuf = PS4AUDIO_GetDeviceBuf;
++    impl->CloseDevice = PS4AUDIO_CloseDevice;
++    impl->OnlyHasDefaultPlaybackDevice = true;
++    return true; // this audio target is available.
++}
++
++AudioBootStrap PS4AUDIO_bootstrap = {
++    "ps4", "PS4 audio driver", PS4AUDIO_Init, false, false
++};
++
++#endif // SDL_AUDIO_DRIVER_PS4
+diff --git a/src/audio/ps4/SDL_ps4audio.h b/src/audio/ps4/SDL_ps4audio.h
+new file mode 100644
+index 0000000..6850db1
+--- /dev/null
++++ b/src/audio/ps4/SDL_ps4audio.h
+@@ -0,0 +1,40 @@
++/*
++  Simple DirectMedia Layer
++  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
++
++  This software is provided 'as-is', without any express or implied
++  warranty.  In no event will the authors be held liable for any damages
++  arising from the use of this software.
++
++  Permission is granted to anyone to use this software for any purpose,
++  including commercial applications, and to alter it and redistribute it
++  freely, subject to the following restrictions:
++
++  1. The origin of this software must not be misrepresented; you must not
++     claim that you wrote the original software. If you use this software
++     in a product, an acknowledgment in the product documentation would be
++     appreciated but is not required.
++  2. Altered source versions must be plainly marked as such, and must not be
++     misrepresented as being the original software.
++  3. This notice may not be removed or altered from any source distribution.
++*/
++#include "SDL_internal.h"
++
++#ifndef SDL_ps4audio_h_
++#define SDL_ps4audio_h_
++
++#include "../SDL_sysaudio.h"
++
++// Buffers handed to the console one after another: sceAudioOutOutput() returns once the previous
++// one has been consumed, so the one being filled is never the one being played.
++#define PS4AUDIO_NUM_BUFFERS 3
++
++struct SDL_PrivateAudioData
++{
++    int port;                                    // sceAudioOut handle
++    Uint8 *rawbuf;                               // the raw allocated mixing buffer
++    Uint8 *mixbufs[PS4AUDIO_NUM_BUFFERS];        // individual mixing buffers
++    int next_buffer;                             // index of the next available mixing buffer
++};
++
++#endif // SDL_ps4audio_h_
